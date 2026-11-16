@@ -655,12 +655,16 @@ public:
         this->env = env;
     }
 
-    void preAppSpecialize(zygisk::AppSpecializeArgs *) override {
+    void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+        if (args->uid < 10000) {
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
         install("app");
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs *) override {
-        install("server");
+        api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }
 
 private:
