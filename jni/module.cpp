@@ -10,6 +10,13 @@
 // 4. PLT-hooking libselinux APIs as defense-in-depth against detectors
 //    that still use the userspace library.
 
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <linux/audit.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <signal.h>
+#include <ucontext.h>
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
@@ -645,10 +652,129 @@ static int register_against_all_libs(zygisk::Api *api) {
     fclose(fp);
     return n;
 }
+// ---- Seccomp Direct Syscall Interceptor (ARM64) ----
+
+static struct sigaction orig_sigsys_act = {};
+static volatile bool seccomp_installed = false;
+
+static inline long raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x4 __asm__("x4") = a4;
+    register long x5 __asm__("x5") = a5;
+    __asm__ __volatile__("svc #0"
+                         : "+r"(x0)
+                         : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                         : "memory", "cc");
+    return x0;
+}
+
+static int check_selinux_fd_type(int fd) {
+    if (fd < 0) return 0;
+    char proc_path[64];
+    char target[128];
+    snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
+    long len = raw_syscall6(__NR_readlinkat, AT_FDCWD, (long)proc_path, (long)target, sizeof(target) - 1, 0, 0);
+    if (len <= 0) return 0;
+    target[len] = '\0';
+    if (strcmp(target, "/sys/fs/selinux/access") == 0) return 1;
+    if (strcmp(target, "/sys/fs/selinux/status") == 0) return 2;
+    return 0;
+}
+
+static long spoof_access_buffer(char *buf, long bytes_read, size_t max_len) {
+    if (bytes_read <= 0 || bytes_read >= (long)max_len) return bytes_read;
+    buf[bytes_read] = '\0';
+    unsigned int allowed = 0, decided = 0, auditallow = 0, auditdeny = 0, seqno = 0, flags = 0;
+    if (sscanf(buf, "%x %x %x %x %u %x", &allowed, &decided, &auditallow, &auditdeny, &seqno, &flags) == 6) {
+        if (seqno > 1) {
+            int new_len = snprintf(buf, max_len, "%x %x %x %x %u %x",
+                                   allowed, decided, auditallow, auditdeny, 1U, flags);
+            if (new_len > 0) return new_len;
+        }
+    }
+    return bytes_read;
+}
+
+static void sigsys_handler(int signo, siginfo_t *info, void *ucontext) {
+    if (signo != SIGSYS || !info || info->si_code != SYS_SECCOMP || !ucontext) {
+        if ((orig_sigsys_act.sa_flags & SA_SIGINFO) && orig_sigsys_act.sa_sigaction) {
+            orig_sigsys_act.sa_sigaction(signo, info, ucontext);
+        } else if (orig_sigsys_act.sa_handler != SIG_DFL && orig_sigsys_act.sa_handler != SIG_IGN && orig_sigsys_act.sa_handler) {
+            orig_sigsys_act.sa_handler(signo);
+        }
+        return;
+    }
+
+    ucontext_t *uc = (ucontext_t *)ucontext;
+    long nr = uc->uc_mcontext.regs[8];
+    long a0 = uc->uc_mcontext.regs[0];
+    long a1 = uc->uc_mcontext.regs[1];
+    long a2 = uc->uc_mcontext.regs[2];
+    long a3 = uc->uc_mcontext.regs[3];
+    long a4 = uc->uc_mcontext.regs[4];
+    long a5 = uc->uc_mcontext.regs[5];
+
+    if (nr == __NR_read || nr == __NR_pread64) {
+        int fd = (int)a0;
+        int fd_type = check_selinux_fd_type(fd);
+        long ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
+
+        if (fd_type == 1 && ret > 0 && a1 != 0 && a2 > 0) {
+            ret = spoof_access_buffer((char *)a1, ret, (size_t)a2);
+        } else if (fd_type == 2 && ret >= 20 && a1 != 0) {
+            uint32_t *st = (uint32_t *)a1;
+            st[1] = 0;
+            st[2] = 1;
+            st[3] = 0;
+        }
+        uc->uc_mcontext.regs[0] = ret;
+        return;
+    }
+
+    uc->uc_mcontext.regs[0] = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
+}
+
+static void install_seccomp_trap() {
+    if (seccomp_installed) return;
+
+    struct sigaction sa = {};
+    sa.sa_sigaction = sigsys_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGSYS, &sa, &orig_sigsys_act) != 0) return;
+
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, (offsetof(struct seccomp_data, arch))),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, (offsetof(struct seccomp_data, nr))),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_read, 1, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_pread64, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+
+    struct sock_fprog prog = {
+        .len = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
+        .filter = filter,
+    };
+
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0) {
+        if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) == 0) {
+            seccomp_installed = true;
+        }
+    }
+}
 
 // ---- Zygisk module ------------------------------------------------------
 
-class DirtySepBypass : public zygisk::ModuleBase {
+class DirtySepolicyBypass : public zygisk::ModuleBase {
 public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
         this->api = api;
@@ -661,6 +787,13 @@ public:
             return;
         }
         install("app");
+    }
+
+    // <--- TEMPELKAN postAppSpecialize TEPAT DI SINI (di bawah preAppSpecialize) --->
+    void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
+        if (args->uid >= 10000) {
+            install_seccomp_trap();
+        }
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs *) override {
