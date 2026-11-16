@@ -821,4 +821,4 @@ private:
     }
 };
 
-REGISTER_ZYGISK_MODULE(DirtySepBypass)
+REGISTER_ZYGISK_MODULE(DirtySepolicyBypass)
