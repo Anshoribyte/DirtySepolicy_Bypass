@@ -31,7 +31,7 @@
 #include <android/log.h>
 #include "zygisk.hpp"
 
-#define LOG_TAG "DirtySepBypass"
+#define LOG_TAG "DirtySepolicyBypass"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #ifdef DEBUG
