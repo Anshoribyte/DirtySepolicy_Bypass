@@ -1,0 +1,52 @@
+name: Build DirtySepolicy Bypass
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install patchelf and zip
+        run: sudo apt-get update && sudo apt-get install -y patchelf zip
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+
+      - name: Compile module.cpp for arm64-v8a
+        run: |
+          mkdir -p module/zygisk
+          ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang++ \
+            -std=c++17 -fno-exceptions -fno-rtti \
+            -fPIC -shared -O2 \
+            -fvisibility=hidden -fvisibility-inlines-hidden \
+            -fdata-sections -ffunction-sections \
+            -nostdlib++ \
+            -Wall -Wextra \
+            -Wl,--hash-style=both \
+            -Wl,--gc-sections \
+            -Wl,-z,lazy \
+            -Wl,-z,norelro \
+            -Wl,-soname,libdirtysepbypass.so \
+            -o module/zygisk/arm64-v8a.so \
+            jni/module.cpp -llog
+          patchelf --remove-rpath module/zygisk/arm64-v8a.so
+
+      - name: Package Magisk/KSU Module Zip
+        run: |
+          cd module
+          zip -r9 ../dirtysepbypass-custom.zip module.prop customize.sh META-INF zygisk
+
+      - name: Upload Module Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dirtysepbypass-custom
+          path: dirtysepbypass-custom.zip
